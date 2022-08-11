@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: <%= title %>-configmap
+  namespace: <%= namespace %>
+data:
+  NEXTAUTH_URL: <%= nextauth_url %>
+  AZURE_AD_CLIENT_ID: "__AZURE_AD_CLIENT_ID__"
+  AZURE_AD_TENANT_ID: "__AZURE_AD_TENANT_ID__"
+  AZURE_AD_CLIENT_SECRET: "__AZURE_AD_CLIENT_SECRET__"
+  NEXTAUTH_SECRET: "__SECRET__"
+  ANCHOR_FLOW_REMOTE_PATH: https://anchor-flow.dev.maersk-digital.net/_next/static/chunks/remoteEntry.js

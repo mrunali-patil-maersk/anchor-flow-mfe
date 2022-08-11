@@ -1,0 +1,32 @@
+name: trivy-analysis
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-18.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Build an image from Dockerfile
+        run: |
+          docker login https://docker.maerskdev.net -u ${{ secrets.MDN_NEXUS_WRITE_USERNAME }} -p ${{ secrets.MDN_NEXUS_WRITE_PASSWORD }}
+          docker build -t docker.io/my-organization/my-app:${{ github.sha }} --build-arg NEXUS_USER=${{ secrets.MDN_NEXUS_WRITE_USERNAME }} --build-arg NEXUS_PASS=${{ secrets.MDN_NEXUS_WRITE_PASSWORD }} .
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "docker.io/my-organization/my-app:${{ github.sha }}"
+          format: "template"
+          template: "@/contrib/sarif.tpl"
+          output: "trivy-results.sarif"
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v1
+        with:
+          sarif_file: "trivy-results.sarif"

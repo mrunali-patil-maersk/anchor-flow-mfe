@@ -1,0 +1,118 @@
+name: Manually Deploy with build artifact on Azure K8s Cluster
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        type: choice
+        description: "Choose the env to deploy"
+        required: true
+        default: "dev"
+        options:
+          - dev
+          - cdt
+          - prod
+      buildArtifact:
+        description: "Enter the build tag to deploy"
+        required: true
+        default: ""
+
+env:
+  CONTAINER_REGISTRY: maerskao.azurecr.io
+
+jobs:
+  set-image-tag:
+    runs-on: ubuntu-20.04
+    outputs:
+      image-tag: ${{ steps.image_tag.outputs.IMAGE_TAG }}
+    steps:
+      - id: image_tag
+        run: echo "##[set-output name=IMAGE_TAG;]$(echo ${{env.CONTAINER_REGISTRY}}/anchor-flow:${{ github.event.inputs.buildArtifact }})"
+  set-clusters:
+    runs-on: ubuntu-20.04
+    outputs:
+      matrix: ${{ github.event.inputs.env == 'prod' && steps.set-prod-matrix.outputs.matrix || github.event.inputs.env == 'cdt' && steps.set-cdt-matrix.outputs.matrix || steps.set-dev-matrix.outputs.matrix }}
+    steps:
+      - name: set prod matrix
+        if: github.event.inputs.env == 'prod'
+        id: set-prod-matrix
+        run: echo "::set-output name=matrix::{\"include\":[{\"cluster\":\"core-prod-west-1\",\"environment\":\"prod\"}]}"
+
+      - name: set dev matrix
+        if: github.event.inputs.env == 'dev'
+        id: set-dev-matrix
+        run: echo "::set-output name=matrix::{\"include\":[{\"cluster\":\"core-dev-west-1\",\"environment\":\"dev\"}]}"
+
+      - name: set cdt matrix
+        if: github.event.inputs.env == 'cdt'
+        id: set-cdt-matrix
+        run: echo "::set-output name=matrix::{\"include\":[{\"cluster\":\"core-dev-west-1\",\"environment\":\"cdt\"}]}"
+
+  check-matrix:
+    runs-on: ubuntu-20.04
+    needs: set-clusters
+    steps:
+      - name: Install json2yaml
+        run: |
+          sudo npm install -g json2yaml
+
+      - name: Check matrix definition
+        run: |
+          matrix='${{ needs.set-clusters.outputs.matrix }}'
+          echo $matrix
+          echo $matrix | jq .
+          echo $matrix | json2yaml
+
+  deploy:
+    runs-on: ubuntu-20.04
+    environment: ${{ github.event.inputs.env }}
+    needs: [set-image-tag, set-clusters, check-matrix]
+    timeout-minutes: 10
+    name: deploy
+
+    strategy:
+      matrix: ${{fromJson(needs.set-clusters.outputs.matrix)}}
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v2
+        with:
+          repository: "Maersk-Global/anchor-flow-rules"
+          ref: ${{ github.event.inputs.env == 'prod' && 'master' || github.event.inputs.env == 'cdt' && 'cdt' || 'develop' }}
+          token: ${{ secrets.REPO_ACCESS_TOKEN }}
+
+      - name: Docker image in Kubernetes Manifest
+        run: |
+          sed -i "s#__DOCKER_IMAGE_NAME__#${{ needs.set-image-tag.outputs.image-tag }}#g" aks/deploy.yml
+          sed -i "s#__NEXT_PUBLIC_AZURE_AD_CLIENT_ID__#${{ secrets.NEXT_PUBLIC_AZURE_AD_CLIENT_ID }}#g" aks/configmap.yml
+          sed -i "s#__NEXT_PUBLIC_AZURE_AD_TENANT_ID__#${{ secrets.NEXT_PUBLIC_AZURE_AD_TENANT_ID }}#g" aks/configmap.yml
+          sed -i "s#__AZURE_AD_CLIENT_SECRET__#${{ secrets.AZURE_AD_CLIENT_SECRET }}#g" aks/configmap.yml
+          sed -i "s#__AZURE_AD_SERVICE_OBJECT_ID__#${{ secrets.AZURE_AD_SERVICE_OBJECT_ID }}#g" aks/configmap.yml
+          sed -i "s#__SECRET__#${{ secrets.SECRET }}#g" aks/configmap.yml
+
+      - name: Import Secrets
+        uses: hashicorp/vault-action@v2.3.0
+        id: k8ssecrets
+        with:
+          url: https://vault.maersk-digital.net
+          tlsSkipVerify: false
+          exportEnv: false
+          # exportToken: true  - optionally export the VAULT_TOKEN
+          method: approle
+          roleId: ${{ secrets.VAULT_ROLE_ID }}
+          secretId: ${{ secrets.VAULT_ROLE_SECRET_ID }}
+          secrets: |
+            anchoratom-kv/data/kubernetes/${{ matrix.cluster }}/cert cert;
+            anchoratom-kv/data/kubernetes/${{ matrix.cluster }}/token token;
+            anchoratom-kv/data/kubernetes/${{ matrix.cluster }}/server server;
+
+      - name: set kubernetes cluster context for ${{ matrix.cluster }}
+        run: |
+          kubectl config set-credentials default --token=${{ steps.k8ssecrets.outputs.token }};
+          echo ${{ steps.k8ssecrets.outputs.cert }} | base64 -d > ./kubectl-ca.crt;
+          kubectl config set-cluster default --server=${{ steps.k8ssecrets.outputs.server }} --certificate-authority=./kubectl-ca.crt;
+          kubectl config set-context default --cluster=default --user=default;
+          kubectl config use-context default;
+
+      - name: Deploy to cluster ${{ matrix.cluster }} and env ${{ matrix.environment }}
+        run: |
+          kubectl apply -R -f aks
